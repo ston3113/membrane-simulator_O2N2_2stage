@@ -1,18 +1,22 @@
 import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.optimize import fsolve
-import time
 import streamlit as st
 import pandas as pd
 
 # 실행시 >> streamlit run membrane_app_2stage.py
 
-# --- 기본 상수 및 파라미터 ---
+# ==================================================================
+# 1. 기본 상수 및 단위 변환 설정
+# ==================================================================
 STP_MOLAR_VOLUME = 22414.0  # cm³/mol
 BAR_TO_ATM = 0.986923
 M3H_TO_CM3S = 1_000_000.0 / 3600.0
 CM2_TO_M2 = 0.0001
 M2_TO_CM2 = 10000.0
+# GPU to Standard Unit Conversion
+# 1 GPU = 10^-6 cm³(STP) / (cm² · s · cmHg)
+# 1 GPU = 76 * 10^-6 cm³(STP) / (cm² · s · atm)
 GPU_TO_STD_UNITS = 1e-6 * 76.0 
 
 PROCESS_PARAMS_VOL = {
@@ -20,8 +24,7 @@ PROCESS_PARAMS_VOL = {
     "p_p_default": 1.00,  # (bar) - 대기압 배출 가정
 }
 
-# [기본값 설정] 2성분계 (N2, O2)
-# N2(느림), O2(빠름) 가정 (예: Polysulfone 등 일반적인 고분자)
+# [기본값] N2(느림), O2(빠름) GPU 예시
 DEFAULT_L_GPU = np.array([50.0, 250.0]) 
 
 RAW_FEED_FLUX_M3H = 100.00  # (m³/h) 
@@ -29,7 +32,7 @@ RAW_FEED_COMP = np.array([0.79, 0.21]) # 공기 조성 (N2 79%, O2 21%)
 AREA_LIST_M2 = [50.0, 30.0] # 2스테이지 면적
 
 # ==================================================================
-# 2. MembraneStage 클래스 (그대로 유지 - 다성분계 호환)
+# 2. MembraneStage 클래스 (물리적 모델)
 # ==================================================================
 class MembraneStage:
     def __init__(self, name):
@@ -119,7 +122,7 @@ class MembraneStage:
         return True
 
 # ==================================================================
-# 3. Process 클래스 (2단 리사이클 공정으로 수정됨)
+# 3. Process 클래스 (2단 리사이클 공정)
 # ==================================================================
 class Process2Stage:
     def __init__(self, params_list, area_list, stp_molar_volume=22414.0):
@@ -292,6 +295,10 @@ if btn_run:
             res.append(row)
         
         df = pd.DataFrame(res)
+        
+        # [수정된 부분] Stage 이름을 인덱스로 보내서 포맷팅 오류 방지
+        df.set_index("Stage", inplace=True) 
+        
         st.dataframe(df.style.format("{:.2f}"), use_container_width=True)
         
         st.info(f"💡 Final Product (Stage 2 Permeate) O2 Purity: **{proc.stages[1].permeate_comp[1]*100:.2f}%**")
