@@ -4,7 +4,7 @@ from scipy.optimize import fsolve
 import streamlit as st
 import pandas as pd
 
-# 실행시 >> streamlit run membrane_app_2stage.py
+# 실행방법: 터미널에서 >> streamlit run membrane_app_2stage.py
 
 # ==================================================================
 # 1. 기본 상수 및 단위 변환 설정
@@ -96,8 +96,7 @@ class MembraneStage:
         n_comp = len(feed_comp)
         y_state0 = np.hstack((feed_comp, feed_flux))
 
-        # [수정된 부분] 함수 인자에 params를 추가해야 에러가 안 납니다!
-        # solve_ivp가 args를 이벤트 함수에도 던지기 때문입니다.
+        # [수정된 부분] solve_ivp event 함수에 args 전달을 위해 params 추가
         def retentate_empty(t, y, params): 
             return y[-1] - (feed_flux * 0.001)
             
@@ -184,7 +183,7 @@ class Process2Stage:
             s2.run(s2_feed_flux, s2_feed_comp, self.area_list[1], self.params_list[1])
             current_stages.append(s2)
 
-            # Convergence
+            # Convergence Check
             new_recycle_flux = s2.retentate_flux
             err = abs(new_recycle_flux - recycle_flux)
             
@@ -196,6 +195,7 @@ class Process2Stage:
                 self.log_widget.text(log_output + "\n✅ Converged!")
                 return True
             
+            # Relaxation for stability
             recycle_flux = 0.5 * recycle_flux + 0.5 * new_recycle_flux
             recycle_comp = s2.retentate_comp
             
@@ -272,13 +272,20 @@ if btn_run:
                 "Perm (m3/h)": s.permeate_flux * vol_conv,
                 "Perm O2%": s.permeate_comp[1]*100,
                 "Ret (m3/h)": s.retentate_flux * vol_conv,
+                "Ret O2%": s.retentate_comp[1]*100,   # [추가] 잔류측 O2 농도
                 "StageCut": s.stage_cut
             }
             res.append(row)
         
         df = pd.DataFrame(res)
+        
+        # [추가] 컬럼 순서를 논리적인 흐름(Feed -> Perm -> Ret)으로 재배열
+        cols_order = ["Stage", "Feed (m3/h)", "Feed O2%", "Perm (m3/h)", "Perm O2%", "Ret (m3/h)", "Ret O2%", "StageCut"]
+        df = df[cols_order]
+        
         df.set_index("Stage", inplace=True) 
         
+        # 하이라이팅: Perm O2%가 94% 이상이면 초록색 표시
         def highlight_target(val):
             if isinstance(val, float) and val > 94.0:
                 return 'background-color: #d4edda; color: green; font-weight: bold'
