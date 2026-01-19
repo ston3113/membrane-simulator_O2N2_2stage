@@ -19,17 +19,20 @@ M2_TO_CM2 = 10000.0
 # 1 GPU = 76 * 10^-6 cm³(STP) / (cm² · s · atm)
 GPU_TO_STD_UNITS = 1e-6 * 76.0 
 
+# [수정됨] 압력을 높여서(12bar) 고순도 분리 추진력 확보
 PROCESS_PARAMS_VOL = {
-    "p_u_default": 8.00,  # (bar)
-    "p_p_default": 1.00,  # (bar) - 대기압 배출 가정
+    "p_u_default": 12.00,  # (bar) 8.0 -> 12.0 변경
+    "p_p_default": 1.00,   # (bar)
 }
 
-# [기본값] N2(느림), O2(빠름) GPU 예시
-DEFAULT_L_GPU = np.array([50.0, 250.0]) 
+# [수정됨] 선택도 10 설정 (N2=50, O2=500 -> alpha=10)
+DEFAULT_L_GPU = np.array([50.0, 500.0]) 
 
 RAW_FEED_FLUX_M3H = 100.00  # (m³/h) 
 RAW_FEED_COMP = np.array([0.79, 0.21]) # 공기 조성 (N2 79%, O2 21%)
-AREA_LIST_M2 = [50.0, 30.0] # 2스테이지 면적
+
+# [수정됨] S2 면적을 줄여서(12m2) 고순도 O2만 투과시킴
+AREA_LIST_M2 = [80.0, 12.0] 
 
 # ==================================================================
 # 2. MembraneStage 클래스 (물리적 모델)
@@ -146,7 +149,7 @@ class Process2Stage:
             
         return total_flux, total_moles / total_flux
 
-    def run_recycle_process(self, raw_feed_flux, raw_feed_comp, max_iterations=30, tolerance=1e-5):
+    def run_recycle_process(self, raw_feed_flux, raw_feed_comp, max_iterations=50, tolerance=1e-5):
         n_comp = len(raw_feed_comp)
         
         # 초기 리사이클 가정 (Stage 2 Retentate가 Stage 1 앞으로 옴)
@@ -210,6 +213,8 @@ st.markdown("""
 1. **Feed**: Raw Feed + [Stage 2 Retentate (Recycle)]
 2. **Stage 1**: Permeate → Stage 2 Feed
 3. **Stage 2**: Permeate → **Product (O2 Rich)**, Retentate → **Recycle**
+
+**🎯 목표 설정: 선택도 10으로 O2 순도 95% 달성**
 """)
 
 COMP_NAMES = ['N2', 'O2']
@@ -225,6 +230,7 @@ with st.sidebar:
         comp_o2 = st.number_input("O2 몰분율", value=RAW_FEED_COMP[1], format="%.2f")
 
     st.header("2. 스테이지 설정 (GPU)")
+    st.markdown("⚠️ O2 GPU 500 설정 (선택도 10)")
     
     # Stage 1
     st.subheader("Stage 1")
@@ -295,10 +301,29 @@ if btn_run:
             res.append(row)
         
         df = pd.DataFrame(res)
-        
-        # [수정된 부분] Stage 이름을 인덱스로 보내서 포맷팅 오류 방지
         df.set_index("Stage", inplace=True) 
         
-        st.dataframe(df.style.format("{:.2f}"), use_container_width=True)
+        # 색상 스타일링
+        def highlight_o2(val):
+            try:
+                if isinstance(val, float) and val > 94.0:
+                    return 'background-color: #d4edda; color: #155724; font-weight: bold'
+            except:
+                pass
+            return ''
+
+        st.dataframe(df.style.format("{:.2f}").map(highlight_o2, subset=["Perm O2%"]), use_container_width=True)
         
-        st.info(f"💡 Final Product (Stage 2 Permeate) O2 Purity: **{proc.stages[1].permeate_comp[1]*100:.2f}%**")
+        final_purity = proc.stages[1].permeate_comp[1]*100
+        final_flow = proc.stages[1].permeate_flux * vol_conv
+        
+        st.divider()
+        c1, c2 = st.columns(2)
+        c1.metric("Final O2 Purity", f"{final_purity:.2f} %")
+        c2.metric("Product Flow Rate", f"{final_flow:.2f} m³/h")
+        
+        if final_purity >= 95.0:
+            st.balloons()
+            st.success("🎉 목표 순도 95% 달성!")
+        else:
+            st.warning("⚠️ 목표 순도 95% 미달. Stage 2 면적을 줄이거나 압력을 더 높여보세요.")
