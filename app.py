@@ -14,25 +14,22 @@ BAR_TO_ATM = 0.986923
 M3H_TO_CM3S = 1_000_000.0 / 3600.0
 CM2_TO_M2 = 0.0001
 M2_TO_CM2 = 10000.0
-# GPU to Standard Unit Conversion
-# 1 GPU = 10^-6 cm³(STP) / (cm² · s · cmHg)
-# 1 GPU = 76 * 10^-6 cm³(STP) / (cm² · s · atm)
 GPU_TO_STD_UNITS = 1e-6 * 76.0 
 
-# [수정됨] 압력을 높여서(12bar) 고순도 분리 추진력 확보
+# [기본값 설정]
 PROCESS_PARAMS_VOL = {
-    "p_u_default": 12.00,  # (bar) 8.0 -> 12.0 변경
-    "p_p_default": 1.00,   # (bar)
+    "p_u_default": 12.00,  # 12 bar (추진력 확보)
+    "p_p_default": 1.00,   # 대기압
 }
 
-# [수정됨] 선택도 10 설정 (N2=50, O2=500 -> alpha=10)
+# [선택도 10 설정] N2=50, O2=500
 DEFAULT_L_GPU = np.array([50.0, 500.0]) 
 
-RAW_FEED_FLUX_M3H = 100.00  # (m³/h) 
-RAW_FEED_COMP = np.array([0.79, 0.21]) # 공기 조성 (N2 79%, O2 21%)
+RAW_FEED_FLUX_M3H = 100.00  
+RAW_FEED_COMP = np.array([0.79, 0.21]) 
 
-# [수정됨] S2 면적을 줄여서(12m2) 고순도 O2만 투과시킴
-AREA_LIST_M2 = [80.0, 12.0] 
+# [수정됨!!!] S2 면적을 12 -> 2.5로 대폭 축소 (과도한 투과 방지)
+AREA_LIST_M2 = [80.0, 2.5] 
 
 # ==================================================================
 # 2. MembraneStage 클래스 (물리적 모델)
@@ -73,23 +70,27 @@ class MembraneStage:
         x = y_state[:n_comp]
         Lu = y_state[n_comp]
 
+        # 잔류 유량이 거의 없으면 변화율 0 (Stop Event가 잡아내겠지만 안전장치)
+        if Lu < 1e-9:
+            return np.zeros(n_comp + 1)
+
         x = np.maximum(x, 0)
-        x /= np.sum(x)
+        sum_x = np.sum(x)
+        if sum_x > 0:
+            x /= sum_x
 
         yi = self._calc_yi_system(x, params)
         Ji = params["L"] * (params["p_u"] * x - params["p_p"] * yi)
-        Ji = np.maximum(Ji, 0)
+        Ji = np.maximum(Ji, 0) # 역류 방지
+        
         dLu_dA = -np.sum(Ji)
-
-        if Lu < 1e-9:
-            dxi_dA = np.zeros(n_comp)
-        else:
-            dxi_dA = (x * np.sum(Ji) - Ji) / Lu
+        
+        # d(xi)/dA 식: d(xi)/dA = (xi * sum(Ji) - Ji) / Lu
+        dxi_dA = (x * np.sum(Ji) - Ji) / Lu
 
         return np.hstack((dxi_dA, dLu_dA))
 
     def run(self, feed_flux, feed_comp, area_target, params):
-        # 정규화
         if not np.isclose(np.sum(feed_comp), 1.0):
              feed_comp = feed_comp / np.sum(feed_comp)
         
@@ -98,26 +99,42 @@ class MembraneStage:
         n_comp = len(feed_comp)
         y_state0 = np.hstack((feed_comp, feed_flux))
 
+        # [코드 수정] 잔류 유량이 0이 되면 적분을 멈추는 이벤트 추가
+        def retentate_empty(t, y):
+            # y[-1]은 Retentate Flux (Lu)
+            return y[-1] - (feed_flux * 0.001) # Feed의 0.1% 남으면 중단
+        retentate_empty.terminal = True
+        retentate_empty.direction = -1
+
         sol = solve_ivp(
             fun=self._odes,
             t_span=[0, area_target],
             y0=y_state0,
             method='RK45',
             args=(params,),
+            events=retentate_empty # 이벤트 등록
         )
 
-        self.area = sol.t[-1]
+        self.area = sol.t[-1] # 실제 사용된 면적 (다 소진되면 target보다 작을 수 있음)
         final_y_state = sol.y[:, -1]
 
-        self.retentate_flux = final_y_state[n_comp]
+        self.retentate_flux = max(final_y_state[n_comp], 0.0)
         self.retentate_comp = np.maximum(final_y_state[:n_comp], 0)
-        self.retentate_comp /= np.sum(self.retentate_comp)
+        if np.sum(self.retentate_comp) > 0:
+            self.retentate_comp /= np.sum(self.retentate_comp)
 
         self.permeate_flux = self.feed_flux - self.retentate_flux
+        
+        # 물질 수지 계산
         if self.permeate_flux > 1e-9:
-            permeate_moles = (self.feed_flux * self.feed_comp) - (self.retentate_flux * self.retentate_comp)
-            self.permeate_comp = np.maximum(permeate_moles, 0)
-            self.permeate_comp /= np.sum(self.permeate_comp)
+            feed_moles = self.feed_flux * self.feed_comp
+            ret_moles = self.retentate_flux * self.retentate_comp
+            permeate_moles = np.maximum(feed_moles - ret_moles, 0)
+            
+            if np.sum(permeate_moles) > 0:
+                self.permeate_comp = permeate_moles / np.sum(permeate_moles)
+            else:
+                self.permeate_comp = np.zeros(n_comp)
         else:
             self.permeate_comp = np.zeros(n_comp)
             
@@ -125,7 +142,7 @@ class MembraneStage:
         return True
 
 # ==================================================================
-# 3. Process 클래스 (2단 리사이클 공정)
+# 3. Process 클래스
 # ==================================================================
 class Process2Stage:
     def __init__(self, params_list, area_list, stp_molar_volume=22414.0):
@@ -136,23 +153,16 @@ class Process2Stage:
         self.log_widget = st.empty()
 
     def _mix_streams(self, flux1, comp1, flux2, comp2):
-        """두 스트림을 섞어서 새로운 조성과 유량을 반환"""
         n_comp = len(comp1)
         moles1 = flux1 * comp1
         moles2 = flux2 * comp2 if flux2 > 0 else np.zeros(n_comp)
-        
         total_moles = moles1 + moles2
         total_flux = np.sum(total_moles)
-        
-        if total_flux < 1e-9:
-            return 0.0, np.zeros(n_comp)
-            
+        if total_flux < 1e-9: return 0.0, np.zeros(n_comp)
         return total_flux, total_moles / total_flux
 
     def run_recycle_process(self, raw_feed_flux, raw_feed_comp, max_iterations=50, tolerance=1e-5):
         n_comp = len(raw_feed_comp)
-        
-        # 초기 리사이클 가정 (Stage 2 Retentate가 Stage 1 앞으로 옴)
         recycle_flux = 0.0
         recycle_comp = np.zeros(n_comp)
 
@@ -162,33 +172,26 @@ class Process2Stage:
         for i in range(max_iterations):
             current_stages = []
             
-            # --- [Stage 1] ---
-            # Feed = Raw Feed + Recycle (S2 Retentate)
+            # S1
             s1_feed_flux, s1_feed_comp = self._mix_streams(
                 raw_feed_flux, raw_feed_comp, recycle_flux, recycle_comp
             )
-            
             s1 = MembraneStage("Stage-1")
             s1.run(s1_feed_flux, s1_feed_comp, self.area_list[0], self.params_list[0])
             current_stages.append(s1)
 
-            # --- [Stage 2] ---
-            # Feed = Stage 1 Permeate (투과기체 캐스케이드)
+            # S2
             s2_feed_flux = s1.permeate_flux
             s2_feed_comp = s1.permeate_comp
-            
             s2 = MembraneStage("Stage-2")
             s2.run(s2_feed_flux, s2_feed_comp, self.area_list[1], self.params_list[1])
             current_stages.append(s2)
 
-            # --- [Recycle Convergence Check] ---
-            # 이번 턴의 S2 Retentate가 다음 턴의 Recycle이 됨
+            # Convergence
             new_recycle_flux = s2.retentate_flux
-            
-            # 오차 계산 (유량 변화량)
             err = abs(new_recycle_flux - recycle_flux)
             
-            log_output += f"Iter {i+1}: Recycle Flux {recycle_flux:.5f} -> {new_recycle_flux:.5f} (Err: {err:.2e})\n"
+            log_output += f"Iter {i+1}: Recyc {recycle_flux:.4f} -> {new_recycle_flux:.4f} | S2_Perm_O2: {s2.permeate_comp[1]*100:.2f}%\n"
             self.log_widget.text(log_output)
 
             if err < tolerance:
@@ -196,8 +199,8 @@ class Process2Stage:
                 self.log_widget.text(log_output + "\n✅ Converged!")
                 return True
             
-            # 업데이트
-            recycle_flux = new_recycle_flux
+            # 수렴 가속 (Relaxation) - 진동 방지
+            recycle_flux = 0.5 * recycle_flux + 0.5 * new_recycle_flux
             recycle_comp = s2.retentate_comp
             
         self.log_widget.text(log_output + "\n❌ Max iterations reached.")
@@ -208,31 +211,19 @@ class Process2Stage:
 # ==================================================================
 st.set_page_config(page_title="2-Stage Membrane Sim", layout="wide")
 st.title("🧪 2-Stage (N2/O2) Membrane Simulator")
-st.markdown("""
-**공정 구조 (2-Stage Permeate Cascade):**
-1. **Feed**: Raw Feed + [Stage 2 Retentate (Recycle)]
-2. **Stage 1**: Permeate → Stage 2 Feed
-3. **Stage 2**: Permeate → **Product (O2 Rich)**, Retentate → **Recycle**
-
-**🎯 목표 설정: 선택도 10으로 O2 순도 95% 달성**
-""")
 
 COMP_NAMES = ['N2', 'O2']
 
 with st.sidebar:
     st.header("1. 초기 원료 (Raw Feed)")
     feed_flux_m3h = st.number_input("총 유량 (m³/h)", value=RAW_FEED_FLUX_M3H)
-    
     col1, col2 = st.columns(2)
-    with col1:
-        comp_n2 = st.number_input("N2 몰분율", value=RAW_FEED_COMP[0], format="%.2f")
-    with col2:
-        comp_o2 = st.number_input("O2 몰분율", value=RAW_FEED_COMP[1], format="%.2f")
+    with col1: comp_n2 = st.number_input("N2 몰분율", value=RAW_FEED_COMP[0], format="%.2f")
+    with col2: comp_o2 = st.number_input("O2 몰분율", value=RAW_FEED_COMP[1], format="%.2f")
 
     st.header("2. 스테이지 설정 (GPU)")
-    st.markdown("⚠️ O2 GPU 500 설정 (선택도 10)")
+    st.info("💡 Tip: S2 Area를 작게 해야 고순도가 나옵니다.")
     
-    # Stage 1
     st.subheader("Stage 1")
     a1 = st.number_input("S1 Area (m²)", value=AREA_LIST_M2[0])
     pu1 = st.number_input("S1 Upstream (bar)", value=PROCESS_PARAMS_VOL["p_u_default"], key="pu1")
@@ -240,9 +231,9 @@ with st.sidebar:
     l1_n2 = st.number_input("S1 N2 GPU", value=DEFAULT_L_GPU[0], key="l1n2")
     l1_o2 = st.number_input("S1 O2 GPU", value=DEFAULT_L_GPU[1], key="l1o2")
 
-    # Stage 2
     st.subheader("Stage 2")
-    a2 = st.number_input("S2 Area (m²)", value=AREA_LIST_M2[1])
+    # 여기서 기본값을 2.5로 변경
+    a2 = st.number_input("S2 Area (m²)", value=AREA_LIST_M2[1]) 
     pu2 = st.number_input("S2 Upstream (bar)", value=PROCESS_PARAMS_VOL["p_u_default"], key="pu2")
     pp2 = st.number_input("S2 Permeate (bar)", value=PROCESS_PARAMS_VOL["p_p_default"], key="pp2")
     l2_n2 = st.number_input("S2 N2 GPU", value=DEFAULT_L_GPU[0], key="l2n2")
@@ -251,17 +242,12 @@ with st.sidebar:
     btn_run = st.button("실행 (Run)")
 
 if btn_run:
-    # 데이터 정리
     raw_feed_comp = np.array([comp_n2, comp_o2])
-    # 정규화
     if abs(sum(raw_feed_comp) - 1.0) > 1e-3:
         raw_feed_comp = raw_feed_comp / sum(raw_feed_comp)
-        st.toast("Feed 조성이 1이 아니라 정규화했습니다.")
 
-    # 단위 변환
     raw_feed_flux_mol = (feed_flux_m3h * M3H_TO_CM3S) / STP_MOLAR_VOLUME
     
-    # GPU -> Mol/s 단위
     def get_params(pu, pp, gpu_n2, gpu_o2):
         gpu_arr = np.array([gpu_n2, gpu_o2])
         L_std = gpu_arr * GPU_TO_STD_UNITS
@@ -274,56 +260,44 @@ if btn_run:
     ]
     area_list_cm2 = [a1 * M2_TO_CM2, a2 * M2_TO_CM2]
 
-    # 실행
     proc = Process2Stage(params_list, area_list_cm2, STP_MOLAR_VOLUME)
     success = proc.run_recycle_process(raw_feed_flux_mol, raw_feed_comp)
 
     if success:
         st.success("계산 완료!")
         
-        # 결과 테이블 생성
         res = []
-        vol_conv = STP_MOLAR_VOLUME * (3600/1e6) # mol/s -> m3/h
+        vol_conv = STP_MOLAR_VOLUME * (3600/1e6) 
 
         for s in proc.stages:
             row = {
                 "Stage": s.name,
                 "Feed (m3/h)": s.feed_flux * vol_conv,
-                "Feed N2%": s.feed_comp[0]*100,
                 "Feed O2%": s.feed_comp[1]*100,
                 "Perm (m3/h)": s.permeate_flux * vol_conv,
-                "Perm N2%": s.permeate_comp[0]*100,
                 "Perm O2%": s.permeate_comp[1]*100,
                 "Ret (m3/h)": s.retentate_flux * vol_conv,
-                "Ret N2%": s.retentate_comp[0]*100,
-                "Ret O2%": s.retentate_comp[1]*100,
+                "StageCut": s.stage_cut
             }
             res.append(row)
         
         df = pd.DataFrame(res)
         df.set_index("Stage", inplace=True) 
         
-        # 색상 스타일링
-        def highlight_o2(val):
-            try:
-                if isinstance(val, float) and val > 94.0:
-                    return 'background-color: #d4edda; color: #155724; font-weight: bold'
-            except:
-                pass
+        def highlight_target(val):
+            if isinstance(val, float) and val > 94.0:
+                return 'background-color: #d4edda; color: green; font-weight: bold'
             return ''
-
-        st.dataframe(df.style.format("{:.2f}").map(highlight_o2, subset=["Perm O2%"]), use_container_width=True)
+            
+        st.dataframe(df.style.format("{:.2f}").map(highlight_target, subset=["Perm O2%"]), use_container_width=True)
         
-        final_purity = proc.stages[1].permeate_comp[1]*100
+        final_o2 = proc.stages[1].permeate_comp[1]*100
         final_flow = proc.stages[1].permeate_flux * vol_conv
         
-        st.divider()
-        c1, c2 = st.columns(2)
-        c1.metric("Final O2 Purity", f"{final_purity:.2f} %")
-        c2.metric("Product Flow Rate", f"{final_flow:.2f} m³/h")
-        
-        if final_purity >= 95.0:
-            st.balloons()
-            st.success("🎉 목표 순도 95% 달성!")
-        else:
-            st.warning("⚠️ 목표 순도 95% 미달. Stage 2 면적을 줄이거나 압력을 더 높여보세요.")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Final O2 Purity", f"{final_o2:.2f} %")
+        c2.metric("Product Flow", f"{final_flow:.2f} m³/h")
+        c3.metric("S2 Stage Cut", f"{proc.stages[1].stage_cut:.3f}")
+
+        if proc.stages[1].stage_cut > 0.95:
+            st.error("⚠️ 경고: Stage 2 Stage Cut이 1.0에 가깝습니다. 면적(Area)이 너무 커서 분리가 안 되고 있습니다.")
