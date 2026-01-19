@@ -28,7 +28,7 @@ DEFAULT_L_GPU = np.array([50.0, 500.0])
 RAW_FEED_FLUX_M3H = 100.00  
 RAW_FEED_COMP = np.array([0.79, 0.21]) 
 
-# [수정됨!!!] S2 면적을 12 -> 2.5로 대폭 축소 (과도한 투과 방지)
+# [S2 면적 축소] 2.5 m2
 AREA_LIST_M2 = [80.0, 2.5] 
 
 # ==================================================================
@@ -70,7 +70,6 @@ class MembraneStage:
         x = y_state[:n_comp]
         Lu = y_state[n_comp]
 
-        # 잔류 유량이 거의 없으면 변화율 0 (Stop Event가 잡아내겠지만 안전장치)
         if Lu < 1e-9:
             return np.zeros(n_comp + 1)
 
@@ -81,11 +80,9 @@ class MembraneStage:
 
         yi = self._calc_yi_system(x, params)
         Ji = params["L"] * (params["p_u"] * x - params["p_p"] * yi)
-        Ji = np.maximum(Ji, 0) # 역류 방지
+        Ji = np.maximum(Ji, 0) 
         
         dLu_dA = -np.sum(Ji)
-        
-        # d(xi)/dA 식: d(xi)/dA = (xi * sum(Ji) - Ji) / Lu
         dxi_dA = (x * np.sum(Ji) - Ji) / Lu
 
         return np.hstack((dxi_dA, dLu_dA))
@@ -99,10 +96,11 @@ class MembraneStage:
         n_comp = len(feed_comp)
         y_state0 = np.hstack((feed_comp, feed_flux))
 
-        # [코드 수정] 잔류 유량이 0이 되면 적분을 멈추는 이벤트 추가
-        def retentate_empty(t, y):
-            # y[-1]은 Retentate Flux (Lu)
-            return y[-1] - (feed_flux * 0.001) # Feed의 0.1% 남으면 중단
+        # [수정된 부분] 함수 인자에 params를 추가해야 에러가 안 납니다!
+        # solve_ivp가 args를 이벤트 함수에도 던지기 때문입니다.
+        def retentate_empty(t, y, params): 
+            return y[-1] - (feed_flux * 0.001)
+            
         retentate_empty.terminal = True
         retentate_empty.direction = -1
 
@@ -112,10 +110,10 @@ class MembraneStage:
             y0=y_state0,
             method='RK45',
             args=(params,),
-            events=retentate_empty # 이벤트 등록
+            events=retentate_empty
         )
 
-        self.area = sol.t[-1] # 실제 사용된 면적 (다 소진되면 target보다 작을 수 있음)
+        self.area = sol.t[-1]
         final_y_state = sol.y[:, -1]
 
         self.retentate_flux = max(final_y_state[n_comp], 0.0)
@@ -125,7 +123,6 @@ class MembraneStage:
 
         self.permeate_flux = self.feed_flux - self.retentate_flux
         
-        # 물질 수지 계산
         if self.permeate_flux > 1e-9:
             feed_moles = self.feed_flux * self.feed_comp
             ret_moles = self.retentate_flux * self.retentate_comp
@@ -199,7 +196,6 @@ class Process2Stage:
                 self.log_widget.text(log_output + "\n✅ Converged!")
                 return True
             
-            # 수렴 가속 (Relaxation) - 진동 방지
             recycle_flux = 0.5 * recycle_flux + 0.5 * new_recycle_flux
             recycle_comp = s2.retentate_comp
             
@@ -232,7 +228,6 @@ with st.sidebar:
     l1_o2 = st.number_input("S1 O2 GPU", value=DEFAULT_L_GPU[1], key="l1o2")
 
     st.subheader("Stage 2")
-    # 여기서 기본값을 2.5로 변경
     a2 = st.number_input("S2 Area (m²)", value=AREA_LIST_M2[1]) 
     pu2 = st.number_input("S2 Upstream (bar)", value=PROCESS_PARAMS_VOL["p_u_default"], key="pu2")
     pp2 = st.number_input("S2 Permeate (bar)", value=PROCESS_PARAMS_VOL["p_p_default"], key="pp2")
