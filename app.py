@@ -158,7 +158,7 @@ class Process2Stage:
         if total_flux < 1e-9: return 0.0, np.zeros(n_comp)
         return total_flux, total_moles / total_flux
 
-    def run_recycle_process(self, raw_feed_flux, raw_feed_comp, max_iterations=50, tolerance=1e-5):
+    def run_recycle_process(self, raw_feed_flux, raw_feed_comp, max_iterations=150, tolerance=1e-5):
         n_comp = len(raw_feed_comp)
         recycle_flux = 0.0
         recycle_comp = np.zeros(n_comp)
